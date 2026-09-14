@@ -21,6 +21,7 @@ class AuthOptimizer {
   private cachedBootstrap: any = null;
   private sessionTimestamp: number = 0;
   private bootstrapTimestamp: number = 0;
+  private sessionGeneration = 0;
   
   // Cache durations
   private readonly SESSION_CACHE_MS = 5 * 60 * 1000; // 5 minutes
@@ -69,10 +70,13 @@ class AuthOptimizer {
     }
     
     // Start new session fetch with timeout
-    this.sessionPromise = this.fetchSessionWithTimeout();
+    const generation = this.sessionGeneration;
+    const pending = this.fetchSessionWithTimeout();
+    this.sessionPromise = pending;
     
     try {
-      const session = await this.sessionPromise;
+      const session = await pending;
+      if (generation !== this.sessionGeneration) return this.cachedSession;
       
       if (session) {
         console.log('[AuthOptimizer] Session retrieved successfully, user:', session.user?.email);
@@ -86,7 +90,7 @@ class AuthOptimizer {
       
       return session;
     } finally {
-      this.sessionPromise = null;
+      if (this.sessionPromise === pending) this.sessionPromise = null;
     }
   }
   
@@ -94,6 +98,7 @@ class AuthOptimizer {
    * Get bootstrap data with caching and deduplication
    */
   async getBootstrapData(forceRefresh: boolean = false): Promise<any> {
+    const initialGeneration = this.sessionGeneration;
     const now = Date.now();
     
     // Return cached bootstrap if valid and not forcing refresh
@@ -110,10 +115,12 @@ class AuthOptimizer {
     
     // Ensure we have a valid session first
     let session = await this.getSession();
+    if (initialGeneration !== this.sessionGeneration) return null;
     if (!session) {
       console.warn('[AuthOptimizer] No session available for bootstrap fetch, checking for existing session');
       // Try to get session directly as a last resort
       const { data: { session: directSession } } = await supabase.auth.getSession();
+      if (initialGeneration !== this.sessionGeneration) return null;
       if (directSession) {
         SecureAPI.setAccessToken(directSession.access_token);
         this.cachedSession = directSession;
@@ -125,15 +132,18 @@ class AuthOptimizer {
     }
     
     // Start new bootstrap fetch with timeout
-    this.bootstrapPromise = this.fetchBootstrapWithTimeout(session);
+    const generation = this.sessionGeneration;
+    const pending = this.fetchBootstrapWithTimeout(session);
+    this.bootstrapPromise = pending;
     
     try {
-      const bootstrap = await this.bootstrapPromise;
+      const bootstrap = await pending;
+      if (generation !== this.sessionGeneration) return null;
       this.cachedBootstrap = bootstrap;
       this.bootstrapTimestamp = now;
       return bootstrap;
     } finally {
-      this.bootstrapPromise = null;
+      if (this.bootstrapPromise === pending) this.bootstrapPromise = null;
     }
   }
   
@@ -141,6 +151,7 @@ class AuthOptimizer {
    * Clear all cached data
    */
   clearCache(): void {
+    this.sessionGeneration += 1;
     this.cachedSession = null;
     this.cachedBootstrap = null;
     this.sessionTimestamp = 0;
@@ -156,6 +167,7 @@ class AuthOptimizer {
   storeSession(session: any): void {
     try {
       if (session && session.access_token) {
+        if (this.cachedSession?.access_token !== session.access_token) this.clearCache();
         this.cachedSession = session;
         this.sessionTimestamp = Date.now();
         SecureAPI.setAccessToken(session.access_token);
@@ -170,8 +182,7 @@ class AuthOptimizer {
    * Clear cached session and remove token from SecureAPI
    */
   clearSession(): void {
-    this.cachedSession = null;
-    this.sessionTimestamp = 0;
+    this.clearCache();
     try { SecureAPI.setAccessToken(null as any); } catch {}
     console.log('[AuthOptimizer] Session cleared');
   }
@@ -191,6 +202,7 @@ class AuthOptimizer {
    * Fetch session with timeout
    */
   private async fetchSessionWithTimeout(): Promise<any> {
+    const generation = this.sessionGeneration;
     if (typeof window !== 'undefined' && (window as any).__isLoggingOut) {
       console.log('[AuthOptimizer] Skipping fetchSessionWithTimeout - logout in progress');
       return null;
@@ -225,6 +237,7 @@ class AuthOptimizer {
         // First try quick check
         const { quickSessionCheck } = await import('./quickSessionCheck');
         const quickCheck = await quickSessionCheck();
+        if (generation !== this.sessionGeneration) return null;
         
         if (quickCheck.hasSession && quickCheck.session) {
           const elapsed = Date.now() - startTime;
@@ -236,6 +249,7 @@ class AuthOptimizer {
         
         // Fall back to session recovery if no quick session
         const session = await sessionRecovery.recoverSession();
+        if (generation !== this.sessionGeneration) return null;
         
         const elapsed = Date.now() - startTime;
         

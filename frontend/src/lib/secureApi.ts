@@ -43,6 +43,31 @@ export class TenantIsolationError extends Error {
   }
 }
 
+export interface DashboardProperty {
+  id: string;
+  name: string;
+  timezone: string;
+}
+
+export interface DashboardSummary {
+  property_id: string;
+  timezone: string;
+  year: number | null;
+  month: number | null;
+  reservations_count: number;
+  total_revenue: string | null;
+  currency: string | null;
+  totals_by_currency: Array<{ currency: string; total_revenue: string; reservations_count: number }>;
+}
+
+class APIRequestError extends Error {
+  public status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.status = status;
+  }
+}
+
 export class SecureAPIClient {
   private static instance: SecureAPIClient;
   private backendUrl: string;
@@ -50,6 +75,7 @@ export class SecureAPIClient {
   private securityViolations: string[] = [];
   private cachedToken: string | null = null;
   private cachedTenantId: string | null = null;
+  private sessionGeneration = 0;
 
   // Request deduplication
   private pendingRequests = new Map<string, Promise<any>>();
@@ -114,11 +140,15 @@ export class SecureAPIClient {
    * Gets authentication headers for backend requests
    */
   private async getAuthHeaders(): Promise<HeadersInit> {
+    if (typeof window !== 'undefined' && (window as any).__isLoggingOut) {
+      throw new TenantIsolationError('Signed out');
+    }
     // Try cached token first for performance
     let token = this.cachedToken;
 
     // If no cached token, get a validated session
     if (!token) {
+      const generation = this.sessionGeneration;
       console.log('[SecureAPI] No cached token, waiting for session or validating...');
       // First, wait briefly for a session to appear to avoid racing login
       const waited = await this.waitForSession(5000);
@@ -128,9 +158,13 @@ export class SecureAPIClient {
         throw new TenantIsolationError('No valid authentication token available');
       }
 
+      if (generation !== this.sessionGeneration && this.cachedToken !== session.access_token) {
+        throw new TenantIsolationError('Session changed while authenticating');
+      }
+
       token = session.access_token;
       // Update cached token for next request
-      this.cachedToken = token;
+      this.setAccessToken(token);
     }
 
     return {
@@ -148,6 +182,7 @@ export class SecureAPIClient {
   public setAccessToken(token: string | null) {
     // Clear cached tenant ID when token changes to prevent cross-tenant contamination
     if (this.cachedToken !== token) {
+      this.sessionGeneration += 1;
       const previousTenant = this.cachedTenantId;
       this.cachedTenantId = null;
       // Clear cache when switching tenants
@@ -179,35 +214,24 @@ export class SecureAPIClient {
       if (token) {
         let extractedTenantId = null;
 
-        // Handle static local token.
-        if (token === "mock-token-123") {
-          extractedTenantId = "tenant-a";
-        }
-        // Check if it's a valid JWT
-        else if (token.includes('.') && token.split('.').length === 3) {
-          const payload = JSON.parse(atob(token.split('.')[1]));
-          extractedTenantId = payload.user_metadata?.tenant_id || payload.tenant_id;
+        if (token.split('.').length === 3) {
+          const payload = JSON.parse(atob(token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/')));
+          extractedTenantId = payload.tenant_id || payload.app_metadata?.tenant_id;
         }
 
         if (extractedTenantId) {
-          // Validate tenant ID format (should be UUID)
+          // Tenant IDs are opaque strings; the fixture uses tenant-a and tenant-b.
           if (this.isValidTenantId(extractedTenantId)) {
             this.cachedTenantId = extractedTenantId;
             return this.cachedTenantId;
           } else {
             console.error('[SecureAPI] Invalid tenant ID format:', extractedTenantId);
-            // Clear invalid session to force re-authentication
-            this.cachedToken = null;
-            this.cachedTenantId = null;
           }
         }
       }
     } catch (error) {
       console.error('[SecureAPI] JWT parsing failed - clearing session:', error);
-      // Clear potentially corrupted session data
-      this.cachedToken = null;
-      this.cachedTenantId = null;
-      this.clearCache();
+      this.setAccessToken(null);
     }
 
     // Return null instead of dangerous 'default' fallback
@@ -222,14 +246,14 @@ export class SecureAPIClient {
     try {
       const token = this.cachedToken;
       if (token) {
-        const payload = JSON.parse(atob(token.split('.')[1]));
+        const payload = JSON.parse(atob(token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/')));
         // Use user sub (unique ID) + email as session key for isolation
         const userSub = payload.sub;
         const userEmail = payload.email;
 
         if (userSub && userEmail) {
           // Create short hash to avoid very long cache keys
-          const sessionKey = `${userSub.substring(0, 8)}-${userEmail.split('@')[0]}`;
+          const sessionKey = `${userSub}-${userEmail}`;
           return sessionKey;
         }
       }
@@ -243,9 +267,7 @@ export class SecureAPIClient {
    * Validate tenant ID format for security
    */
   private isValidTenantId(tenantId: string): boolean {
-    // Check for UUID format (basic validation)
-    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-    return typeof tenantId === 'string' && tenantId.length > 0 && uuidRegex.test(tenantId);
+    return typeof tenantId === 'string' && /^[A-Za-z0-9_-]{1,200}$/.test(tenantId);
   }
 
   /**
@@ -344,7 +366,7 @@ export class SecureAPIClient {
    */
   public emergencySecurityClear(): void {
     console.warn('[SecureAPI EMERGENCY] Security clear - all cache and session data cleared');
-    this.cachedToken = null;
+    this.setAccessToken(null);
     this.cachedTenantId = null;
     this.requestCache.clear();
     this.pendingRequests.clear();
@@ -392,7 +414,7 @@ export class SecureAPIClient {
       });
     }
 
-    return cacheKey;
+    return `${this.sessionGeneration}:${cacheKey}`;
   }
 
   /**
@@ -548,17 +570,26 @@ export class SecureAPIClient {
     const timestamp = new Date().toISOString();
     console.log(`[API REQUEST] ${timestamp} - ${method} ${endpoint}`);
 
-    // Create a tenant-isolated unique key for this request
+    // Resolve auth first so the key and request always belong to the same session.
+    const headers = await this.getAuthHeaders();
+    const generation = this.sessionGeneration;
     const tenantId = await this.getTenantId();
+
+    if (generation !== this.sessionGeneration) {
+      throw new TenantIsolationError('Session changed');
+    }
 
     if (!tenantId) {
       console.warn(`[API SECURITY] No valid tenant ID - bypassing cache for ${endpoint}`);
-      return this.executeRequest<T>(endpoint, options, null, false);
+      return this.executeRequest<T>(endpoint, options, null, false, generation, headers);
     }
 
     // Generate cache key that includes query parameters to prevent cache collisions
     // between different filters (e.g., different cleaning tabs)
     const requestKey = await this.generateCacheKey(method, endpoint, tenantId);
+    if (generation !== this.sessionGeneration) {
+      throw new TenantIsolationError('Session changed');
+    }
 
     // For GET requests, check cache first (only with valid tenant)
     if (isGetRequest) {
@@ -589,8 +620,10 @@ export class SecureAPIClient {
 
           // Empty overdue results are valid and should be returned from deduplication
           console.log(`[API DEDUP SUCCESS] ${endpoint} - returned cached result`);
+          if (generation !== this.sessionGeneration) throw new TenantIsolationError('Session changed');
           return result;
         } catch (error) {
+          if (error instanceof TenantIsolationError || (error as Error).name === 'AbortError') throw error;
           console.warn('[SecureAPI] Pending request failed or timed out, making fresh request:', error);
           this.pendingRequests.delete(requestKey);
           // Continue to make fresh request
@@ -599,7 +632,7 @@ export class SecureAPIClient {
     }
 
     // Create the request promise
-    const requestPromise = this.executeRequest<T>(endpoint, options, requestKey, isGetRequest);
+    const requestPromise = this.executeRequest<T>(endpoint, options, requestKey, isGetRequest, generation, headers);
 
     // Store pending request for deduplication (only with valid cache key)
     if (isGetRequest && requestKey) {
@@ -616,7 +649,9 @@ export class SecureAPIClient {
     endpoint: string,
     options: RequestInit,
     requestKey: string | null,
-    isGetRequest: boolean
+    isGetRequest: boolean,
+    generation: number,
+    headers: HeadersInit
   ): Promise<T> {
     const MAX_RETRIES = 3; // Increased for better resilience
     const RETRY_DELAY_BASE = 1000; // Reasonable delay for retries
@@ -624,7 +659,8 @@ export class SecureAPIClient {
 
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
       try {
-        const headers = await this.getAuthHeaders();
+        if (generation !== this.sessionGeneration) throw new TenantIsolationError('Session changed');
+        if (options.signal?.aborted) throw new DOMException('Request aborted', 'AbortError');
         const url = `${this.backendUrl}${endpoint}`;
 
 
@@ -642,10 +678,12 @@ export class SecureAPIClient {
             ...options.headers
           }
         });
+        if (generation !== this.sessionGeneration) throw new TenantIsolationError('Session changed');
 
         if (!response.ok) {
           let bodyText = '';
           try { bodyText = await response.text(); } catch { }
+          if (generation !== this.sessionGeneration) throw new TenantIsolationError('Session changed');
           let detail = '';
           let errorData = null;
 
@@ -670,35 +708,14 @@ export class SecureAPIClient {
             );
           }
 
-          // If we get 401, try to refresh the session before retrying
+          // Local auth has no refresh token; never retry an old request as a new account.
           if (response.status === 401) {
-            console.log('[SecureAPI] Got 401, attempting to refresh session...');
-
-            // Import sessionValidator dynamically to avoid circular dependency
-            const { sessionValidator } = await import('../utils/sessionValidator');
-
-            // Clear cached token
-            this.cachedToken = null;
-
-            // Try to validate/refresh the session
-            const refreshedSession = await sessionValidator.validateSession();
-
-            if (refreshedSession?.access_token) {
-              console.log('[SecureAPI] Session refreshed, will retry with new token');
-              this.cachedToken = refreshedSession.access_token;
-
-              // Only retry if we haven't exceeded max attempts
-              if (attempt < MAX_RETRIES) {
-                throw new Error('Authentication refreshed, will retry with new token');
-              }
-            }
-
-            // If we can't refresh or no more retries, fail with 401
-            throw new Error('Authentication failed - please login again');
+            this.setAccessToken(null);
+            throw new TenantIsolationError('Authentication failed - please login again');
           }
 
           const msg = detail || bodyText || `${response.status} ${response.statusText}`;
-          throw new Error(`API request failed: ${msg}`);
+          throw new APIRequestError(`API request failed: ${msg}`, response.status);
         }
 
         // Handle response parsing based on content type and status
@@ -723,6 +740,8 @@ export class SecureAPIClient {
           data = text || null;
         }
 
+        if (generation !== this.sessionGeneration) throw new TenantIsolationError('Session changed');
+
         // Cache successful GET requests (with validation for cleaning endpoints)
         if (isGetRequest && data !== null && requestKey) {
           // Apply caching validation for cleaning endpoints to prevent race conditions
@@ -733,7 +752,7 @@ export class SecureAPIClient {
               data,
               timestamp: Date.now()
             });
-            console.log(`[API CACHE STORE] ${endpoint} (tenant: ${requestKey.split(':')[2]})`);
+            console.log(`[API CACHE STORE] ${endpoint}`);
           } else {
             console.log(`[API CACHE SKIP] ${endpoint} - result validation failed`);
           }
@@ -753,7 +772,8 @@ export class SecureAPIClient {
         }
 
         // Don't retry on specific errors
-        if (error instanceof TenantIsolationError) {
+        if (error instanceof TenantIsolationError || (error as Error).name === 'AbortError' ||
+            (error instanceof APIRequestError && error.status < 500)) {
           throw error;
         }
 
@@ -1450,22 +1470,18 @@ export class SecureAPIClient {
 
   // ============= DASHBOARD API =============
   /**
-   * Get dashboard summary with optional simulation header
+   * List properties belonging to the authenticated organization.
    */
-  async getDashboardSummary(propertyId: string, options?: { simulatedTenant?: string, timestamp?: number }) {
+  async getDashboardProperties() {
+    return this.request<{ properties: DashboardProperty[] }>('/api/v1/dashboard/properties');
+  }
+
+  /** Get a monthly, annual, or all-time summary without converting decimal amounts. */
+  async getDashboardSummary(propertyId: string, options?: { year?: number; month?: number }) {
     const queryParams = new URLSearchParams({ property_id: propertyId });
-    if (options?.timestamp) {
-      queryParams.append('_t', options.timestamp.toString());
-    }
-
-    const requestOptions: RequestInit = {};
-    if (options?.simulatedTenant) {
-      requestOptions.headers = {
-        'X-Simulated-Tenant': options.simulatedTenant
-      };
-    }
-
-    return this.request<any>(`/api/v1/dashboard/summary?${queryParams}`, requestOptions);
+    if (options?.year !== undefined) queryParams.set('year', String(options.year));
+    if (options?.month !== undefined) queryParams.set('month', String(options.month));
+    return this.request<DashboardSummary>(`/api/v1/dashboard/summary?${queryParams}`);
   }
 
   async uploadCompanyLogo(logo_url: string) {

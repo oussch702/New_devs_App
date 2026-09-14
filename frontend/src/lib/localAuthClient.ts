@@ -19,8 +19,7 @@ interface AuthSession {
 }
 
 interface AuthResponse {
-  user: AuthUser | null;
-  session: AuthSession | null;
+  data: { user: AuthUser | null; session: AuthSession | null };
   error: Error | null;
 }
 
@@ -33,6 +32,7 @@ class LocalAuthClient {
   private subscribers: ((event: string, session: AuthSession | null) => void)[] = [];
   private session: AuthSession | null = null;
   private storageKey = 'base360-auth-token';
+  private sessionVersion = 0;
 
   constructor() {
     this.loadSession();
@@ -54,6 +54,7 @@ class LocalAuthClient {
   }
 
   private saveSession(session: AuthSession | null) {
+    this.sessionVersion += 1;
     this.session = session;
     if (session) {
       localStorage.setItem(this.storageKey, JSON.stringify(session));
@@ -77,6 +78,7 @@ class LocalAuthClient {
   }
 
   async signInWithPassword(credentials: SignInCredentials): Promise<AuthResponse> {
+    const version = ++this.sessionVersion;
     try {
       const response = await fetch(`${this.getApiUrl()}/api/v1/auth/login`, {
         method: 'POST',
@@ -102,18 +104,19 @@ class LocalAuthClient {
         user: data.user,
       };
 
+      if (version !== this.sessionVersion) {
+        throw new Error('Sign-in was superseded by another session change');
+      }
       this.saveSession(session);
 
       return {
-        user: data.user,
-        session: session,
+        data: { user: data.user, session },
         error: null,
       };
     } catch (error: any) {
       console.error('[LocalAuth] Sign in failed:', error);
       return {
-        user: null,
-        session: null,
+        data: { user: null, session: null },
         error: error,
       };
     }
@@ -121,21 +124,22 @@ class LocalAuthClient {
 
   async signOut(): Promise<{ error: Error | null }> {
     try {
+      const token = this.session?.access_token;
+      // Revoke local access synchronously; a slow logout must not retain a session.
+      this.saveSession(null);
       // Call backend logout endpoint if needed
-      if (this.session?.access_token) {
+      if (token) {
         try {
           await fetch(`${this.getApiUrl()}/api/v1/auth/logout`, {
             method: 'POST',
             headers: {
-              'Authorization': `Bearer ${this.session.access_token}`,
+              'Authorization': `Bearer ${token}`,
             },
           });
         } catch (logoutError) {
           console.warn('[LocalAuth] Backend logout failed (continuing):', logoutError);
         }
       }
-
-      this.saveSession(null);
 
       return { error: null };
     } catch (error: any) {
@@ -144,37 +148,48 @@ class LocalAuthClient {
     }
   }
 
-  async getSession(): Promise<{ data: { session: AuthSession | null } }> {
+  async getSession(): Promise<{ data: { session: AuthSession | null }; error: Error | null }> {
+    const session = this.session;
+    const version = this.sessionVersion;
     // Check if current session is still valid
-    if (this.session?.access_token) {
+    if (session?.access_token) {
       try {
         // Verify token is still valid by calling a protected endpoint
         const response = await fetch(`${this.getApiUrl()}/api/v1/auth/me`, {
           headers: {
-            'Authorization': `Bearer ${this.session.access_token}`,
+            'Authorization': `Bearer ${session.access_token}`,
           },
         });
 
+        // A response from an earlier account cannot clear or restore the current one.
+        if (version !== this.sessionVersion) {
+          return { data: { session: this.session }, error: null };
+        }
         if (response.ok) {
-          return { data: { session: this.session } };
-        } else {
+          return { data: { session }, error: null };
+        } else if (response.status === 401 || response.status === 403) {
           // Session invalid, clear it
           this.saveSession(null);
+        } else {
+          return { data: { session: null }, error: new Error('Session validation unavailable') };
         }
       } catch (error) {
         console.warn('[LocalAuth] Session validation failed:', error);
-        this.saveSession(null);
+        if (version !== this.sessionVersion) {
+          return { data: { session: this.session }, error: null };
+        }
+        return { data: { session: null }, error: error instanceof Error ? error : new Error('Session validation failed') };
       }
     }
 
-    return { data: { session: null } };
+    return { data: { session: null }, error: null };
   }
 
-  async getUser(token?: string): Promise<{ user: AuthUser | null }> {
+  async getUser(token?: string): Promise<{ data: { user: AuthUser | null }; error: Error | null }> {
     const tokenToUse = token || this.session?.access_token;
 
     if (!tokenToUse) {
-      return { user: null };
+      return { data: { user: null }, error: null };
     }
 
     try {
@@ -186,13 +201,13 @@ class LocalAuthClient {
 
       if (response.ok) {
         const userData = await response.json();
-        return { user: userData };
+        return { data: { user: userData }, error: null };
       } else {
-        return { user: null };
+        return { data: { user: null }, error: new Error(`User validation failed (${response.status})`) };
       }
     } catch (error) {
       console.error('[LocalAuth] Get user failed:', error);
-      return { user: null };
+      return { data: { user: null }, error: error instanceof Error ? error : new Error('User validation failed') };
     }
   }
 

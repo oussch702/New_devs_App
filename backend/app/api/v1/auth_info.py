@@ -91,8 +91,7 @@ async def get_current_user_info(
         ]
         
         # This ensures /auth/me returns correct tenant like other endpoints
-        tenant_id = await TenantResolver.resolve_tenant_id(user_id=user.id, user_email=user.email)
-        logger.info(f"AUTH /me: Fresh tenant lookup for {user.email}: {tenant_id}")
+        tenant_id = user.tenant_id
         
         # Add smart view permissions if user has access
         if tenant_id and not user.is_admin:

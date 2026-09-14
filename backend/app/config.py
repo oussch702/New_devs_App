@@ -41,8 +41,7 @@ class Settings(BaseSettings):
         
         for var_name, value in critical_env_vars.items():
             if value:
-                preview = value[:15] + "..." if len(value) > 15 else value
-                logger.info(f"✅ ENV {var_name}: {preview} (len: {len(value)})")
+                logger.info(f"✅ ENV {var_name}: configured")
             else:
                 logger.info(f"❌ ENV {var_name}: NOT SET")
         
@@ -61,8 +60,7 @@ class Settings(BaseSettings):
         
         for field_name, value in loaded_values.items():
             if value:
-                preview = str(value)[:15] + "..." if len(str(value)) > 15 else str(value)
-                logger.info(f"✅ LOADED {field_name}: {preview} (len: {len(str(value))})")
+                logger.info(f"✅ LOADED {field_name}: configured")
             else:
                 logger.info(f"❌ LOADED {field_name}: NOT SET")
         

@@ -6,6 +6,7 @@ from datetime import datetime
 import logging
 import hashlib
 import asyncio
+import math
 from ..database import supabase
 from ..models.auth import AuthenticatedUser, Permission
 from ..config import settings
@@ -83,7 +84,7 @@ async def authenticate_request(
     # Check cache first
     if token_hash in auth_cache:
         cached_data = auth_cache[token_hash]
-        if datetime.now().timestamp() - cached_data["timestamp"] < CACHE_DURATION:
+        if datetime.now().timestamp() < cached_data.get("expires_at", 0):
             cached_user = cached_data["user"]
             # If not, force a refresh to get proper tenant isolation
             if not cached_user.tenant_id:
@@ -98,27 +99,36 @@ async def authenticate_request(
             # Remove expired cache entry
             del auth_cache[token_hash]
 
-    logger.info(f"AUTH: Starting authentication - Token hash: {token_hash}, Token preview: {token[:20]}...")
+    logger.info(f"AUTH: Starting authentication - Token hash: {token_hash}")
 
     try:
-        logger.debug(f"AUTH: Verifying token with Supabase - Token: {token[:20]}...")
+        token_expiry = None
+        payload = None
 
         # Verify token - handle both Supabase tokens and custom JWT tokens
         try:
             # First try to decode as a custom JWT token.
             try:
+                if settings.supabase_url and settings.supabase_service_role_key:
+                    # A configured deployment uses Supabase as its authority;
+                    # the public challenge signing key is not an auth fallback.
+                    raise JWTError("Supabase token verification required")
                 payload = jwt.decode(
                     token, 
                     settings.secret_key, 
                     algorithms=["HS256"],
-                    audience="authenticated"  # Accept tokens with aud: "authenticated"
+                    audience="authenticated",
+                    options={"require_exp": True, "require_aud": True},
                 )
+                token_expiry = float(payload['exp'])
+                if not math.isfinite(token_expiry) or token_expiry <= datetime.now().timestamp():
+                    raise JWTError("Token expired")
                 logger.info(f"AUTH: Successfully decoded custom JWT token for {payload.get('email')}")
                 
                 # Create a mock user object from JWT payload
                 class MockUser:
                     def __init__(self, payload):
-                        self.id = payload.get('id')
+                        self.id = payload.get('id') or payload.get('sub')
                         self.email = payload.get('email')
                         self.app_metadata = payload.get('app_metadata', {})
                         self.user_metadata = payload.get('user_metadata', {})
@@ -127,7 +137,13 @@ async def authenticate_request(
                 user = MockUser(payload)
                 
             except JWTError:
-                # If custom JWT fails, try Supabase auth
+                # Challenge mode has no alternative token verifier. In particular,
+                # never fall back to its legacy mock or unsigned-token decoder.
+                payload = None
+                token_expiry = None
+                if not (settings.supabase_url and settings.supabase_service_role_key):
+                    raise
+                # A configured Supabase server verifies its own access tokens.
                 response = supabase.auth.get_user(token)
                 user = response.user
                 
@@ -143,7 +159,7 @@ async def authenticate_request(
             f"AUTH: Supabase response - User ID: {user.id if user else None}, Email: {user.email if user else None}"
         )
 
-        if not user:
+        if not user or not user.id or not user.email:
             logger.warning("AUTH: No user found for provided token")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -253,7 +269,15 @@ async def authenticate_request(
         logger.info(f"User: {user.email} (ID: {user.id})")
 
         # Use TenantResolver for comprehensive tenant resolution
-        tenant_id = await TenantResolver.resolve_tenant_id(token=token, user_id=user.id, user_email=user.email)
+        tenant_id = await TenantResolver.resolve_tenant_id(
+            user_id=user.id, user_email=user.email,
+            verified_payload=payload, verified_user=user,
+        )
+        if not tenant_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="No tenant context found",
+            )
 
         # If we found a tenant_id and it's not in the user's metadata, update it for next time
         current_tenant_in_metadata = None
@@ -277,15 +301,20 @@ async def authenticate_request(
             tenant_id=tenant_id,
         )
 
-        # Cache the authentication result
-        auth_cache[token_hash] = {
-            "user": auth_user,
-            "timestamp": datetime.now().timestamp(),
-        }
+        # Only cache locally verified tokens with a verified expiration. Supabase
+        # tokens are revalidated remotely on each request instead of extending
+        # their lifetime using our cache's independent TTL.
+        if token_expiry is not None:
+            now = datetime.now().timestamp()
+            auth_cache[token_hash] = {
+                "user": auth_user,
+                "timestamp": now,
+                "expires_at": min(now + CACHE_DURATION, token_expiry),
+            }
 
         # Clean up old cache entries (keep cache size manageable)
         current_time = datetime.now().timestamp()
-        expired_keys = [k for k, v in auth_cache.items() if current_time - v["timestamp"] > CACHE_DURATION]
+        expired_keys = [k for k, v in auth_cache.items() if current_time >= v.get("expires_at", 0)]
         for key in expired_keys:
             del auth_cache[key]
 
@@ -411,7 +440,7 @@ def clear_auth_cache():
 async def verify_token_ws(token: str) -> Optional[AuthenticatedUser]:
     """Verify JWT token for WebSocket connections using same approach as regular authentication"""
     try:
-        logger.debug(f"WS_AUTH: Verifying WebSocket token - Token preview: {token[:20]}...")
+        logger.debug("WS_AUTH: Verifying WebSocket token")
 
         # Use same Supabase verification as regular authentication
         try:
@@ -510,7 +539,12 @@ async def verify_token_ws(token: str) -> Optional[AuthenticatedUser]:
 
         # Use the comprehensive tenant resolver (same as regular auth)
         logger.info(f"WS_AUTH: Resolving tenant for user {user.email}")
-        tenant_id = await TenantResolver.resolve_tenant_id(token=token, user_id=user.id, user_email=user.email)
+        tenant_id = await TenantResolver.resolve_tenant_id(
+            token=token, user_id=user.id, user_email=user.email,
+            verified_user=user,
+        )
+        if not tenant_id:
+            return None
 
         auth_user = AuthenticatedUser(
             id=user.id,

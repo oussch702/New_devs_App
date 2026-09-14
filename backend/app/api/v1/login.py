@@ -4,6 +4,7 @@ from typing import Optional, Dict, Any
 from ...database import supabase
 from ...core.tenant_resolver import TenantResolver
 from ...models.auth import Permission
+from supabase import create_client
 import logging
 import hashlib
 from datetime import datetime, timedelta
@@ -35,12 +36,13 @@ async def login(request: LoginRequest):
     """Login endpoint for local authentication"""
     try:
         email = request.email.lower().strip()
-        password = request.password.strip()
+        password = request.password
+        challenge_mode = not (settings.supabase_url and settings.supabase_service_role_key)
         
         logger.info(f"[LOGIN] Attempting login for: {email}")
         
         # Static credentials - Tenant A.
-        if email == "sunset@propertyflow.com" and password == "client_a_2024":
+        if challenge_mode and email == "sunset@propertyflow.com" and password == "client_a_2024":
             logger.info("[LOGIN] Challenge Mode: Tenant A (Sunset Properties)")
             
             # Create mock JWT token
@@ -70,7 +72,7 @@ async def login(request: LoginRequest):
             )
             
         # Static credentials - Tenant B.
-        if email == "ocean@propertyflow.com" and password == "client_b_2024":
+        if challenge_mode and email == "ocean@propertyflow.com" and password == "client_b_2024":
             logger.info("[LOGIN] Challenge Mode: Tenant B (Ocean Rentals)")
             
             # Create mock JWT token
@@ -99,25 +101,43 @@ async def login(request: LoginRequest):
                 }
             )
         
-        # For other users, check if they exist in the database
-        # This is a simplified auth - in production you'd check password hashes
+        if challenge_mode:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid credentials",
+            )
+
+        # Real Supabase deployments must verify the password, not merely find
+        # an email in the admin user list. A per-login client avoids mutating
+        # the shared service client's authentication session.
         try:
-            # Check if user exists in Supabase auth
-            user_result = supabase.auth.admin.list_users()
-            users = user_result if hasattr(user_result, '__iter__') else []
-            
-            user = None
-            for u in users:
-                if u.email and u.email.lower() == email:
-                    user = u
-                    break
-                    
-            if not user:
+            try:
+                login_client = create_client(
+                    settings.supabase_url,
+                    settings.supabase_anon_key or settings.supabase_service_role_key,
+                )
+                auth_response = login_client.auth.sign_in_with_password({
+                    "email": email, "password": password,
+                })
+                user = auth_response.user
+            except Exception:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Invalid credentials",
+                )
+
+            if not user or not auth_response.session:
                 logger.warning(f"[LOGIN] User not found: {email}")
                 raise HTTPException(
                     status_code=status.HTTP_401_UNAUTHORIZED,
                     detail="Invalid credentials"
                 )
+
+            tenant_id = await TenantResolver.resolve_tenant_id(
+                user_id=user.id, user_email=user.email, verified_user=user,
+            )
+            if not tenant_id:
+                raise HTTPException(status_code=403, detail="No tenant context found")
             
             # Get user permissions
             permissions_response = (
@@ -143,20 +163,7 @@ async def login(request: LoginRequest):
                 (user.app_metadata and user.app_metadata.get("role") == "admin")
             )
             
-            # Resolve tenant ID
-            tenant_id = await TenantResolver.resolve_tenant_id(user_id=user.id, user_email=user.email)
-            
-            # Create JWT token
-            user_data = {
-                "id": user.id,
-                "email": user.email,
-                "is_admin": is_admin,
-                "tenant_id": tenant_id,
-                "exp": datetime.utcnow() + timedelta(hours=24),
-                "aud": "authenticated"
-            }
-            
-            token = jwt.encode(user_data, settings.secret_key, algorithm="HS256")
+            token = auth_response.session.access_token
             
             logger.info(f"[LOGIN] Success for {email}")
             

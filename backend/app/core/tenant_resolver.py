@@ -21,22 +21,14 @@ class TenantResolver:
         Returns:
             Tenant ID if found, None otherwise
         """
-        # Try user_metadata first (most common location)
-        if 'user_metadata' in token_payload:
-            tenant_id = token_payload['user_metadata'].get('tenant_id')
-            if tenant_id:
-                return tenant_id
-
-        # Try app_metadata as fallback
-        if 'app_metadata' in token_payload:
-            tenant_id = token_payload['app_metadata'].get('tenant_id')
-            if tenant_id:
-                return tenant_id
-
-        # Try root level
-        tenant_id = token_payload.get('tenant_id')
-        if tenant_id:
-            return tenant_id
+        # Only call this with verified claims. user_metadata is user-editable
+        # and must never determine which company's data a request can access.
+        app_metadata = token_payload.get('app_metadata') or {}
+        tenant_id = app_metadata.get('tenant_id') if isinstance(app_metadata, dict) else None
+        if tenant_id is None:
+            tenant_id = token_payload.get('tenant_id')
+        if isinstance(tenant_id, str) and tenant_id.strip():
+            return tenant_id.strip()
 
         logger.warning("No tenant_id found in token payload")
         return None
@@ -52,24 +44,17 @@ class TenantResolver:
         Returns:
             Tenant ID if found, None otherwise
         """
-        # Check various possible locations
-        if 'tenant_id' in user_data:
-            return user_data['tenant_id']
-
-        if 'user_metadata' in user_data:
-            tenant_id = user_data['user_metadata'].get('tenant_id')
-            if tenant_id:
-                return tenant_id
-
-        if 'app_metadata' in user_data:
-            tenant_id = user_data['app_metadata'].get('tenant_id')
-            if tenant_id:
-                return tenant_id
-
-        return None
+        return TenantResolver.resolve_tenant_from_token(user_data)
 
     @staticmethod
-    async def resolve_tenant_id(user_id: str, user_email: str, token: Optional[str] = None) -> str:
+    async def resolve_tenant_id(
+        user_id: str,
+        user_email: str,
+        token: Optional[str] = None,
+        *,
+        verified_payload: Optional[dict] = None,
+        verified_user=None,
+    ) -> Optional[str]:
         """
         Resolve tenant ID for a user.
         
@@ -80,16 +65,33 @@ class TenantResolver:
         Returns:
             Tenant ID
         """
-        # Fallback mapping by known user email.
-        if user_email == "sunset@propertyflow.com":
-            return "tenant-a"
-        if user_email == "ocean@propertyflow.com":
-            return "tenant-b"
-        if user_email == "candidate@propertyflow.com":
-            return "tenant-a"
-            
-        # Default fallback
-        return "tenant-a"
+        # Callers may pass identity already verified by the authentication layer.
+        if verified_payload is not None:
+            return TenantResolver.resolve_tenant_from_token(verified_payload)
+        if verified_user is not None:
+            return TenantResolver.resolve_tenant_from_user({
+                'app_metadata': getattr(verified_user, 'app_metadata', None),
+                'tenant_id': getattr(verified_user, 'tenant_id', None),
+            })
+
+        if token:
+            from jose import JWTError, jwt
+            from ..config import settings
+
+            try:
+                payload = jwt.decode(
+                    token, settings.secret_key, algorithms=['HS256'],
+                    audience='authenticated', options={'require_exp': True, 'require_aud': True},
+                )
+                if (payload.get('id') or payload.get('sub')) != user_id:
+                    return None
+                return TenantResolver.resolve_tenant_from_token(payload)
+            except JWTError:
+                return None
+
+        # An email address is not tenant authorization. Missing trusted context
+        # must fail closed instead of silently selecting the first company.
+        return None
 
     @staticmethod
     async def update_user_tenant_metadata(user_id: str, tenant_id: str) -> None:

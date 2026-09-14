@@ -119,5 +119,3 @@ Verified locally on September 14, 2026:
 - The production frontend Docker build passed.
 - Chrome browser checks passed for both logins, authorized property names, exact totals, month/year changes, delayed responses, logout/account switching, refresh, error/retry recovery, and a 390px mobile viewport; no page exceptions occurred.
 - Separate real connection-refusal checks confirmed Redis failure returns the actual database total and PostgreSQL failure returns 503.
-
-For the required recording, follow [LOOM_WALKTHROUGH.md](LOOM_WALKTHROUGH.md).

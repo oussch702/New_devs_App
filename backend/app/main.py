@@ -90,6 +90,10 @@ async def lifespan(app: FastAPI):
     # Startup
     logger.info("Starting up...")
 
+    from .core.database_pool import db_pool
+
+    await db_pool.initialize()
+
     # Initialize Supabase connection pool
     try:
         from .core.supabase_connection_pool import supabase_pool
@@ -119,22 +123,30 @@ async def lifespan(app: FastAPI):
     async_processor.start_background_cleanup()
     logger.info("Async processor background cleanup started")
 
-    yield
-    # Shutdown
-    logger.info("Shutting down...")
-
-    # Shutdown async processor
-    await async_processor.shutdown()
-    logger.info("Async processor shutdown completed")
-
-    # Close connection pool
     try:
-        from .core.supabase_connection_pool import supabase_pool
+        yield
+    finally:
+        logger.info("Shutting down...")
+        from .services.cache import redis_client as revenue_redis_client
 
-        await supabase_pool.close()
-        logger.info("✅ Supabase connection pool closed")
-    except Exception as e:
-        logger.warning(f"⚠️ Error closing connection pool: {e}")
+        # Attempt every cleanup even when another resource fails to close.
+        for name, close in (
+            ("async processor", async_processor.shutdown),
+            ("revenue database pool", db_pool.close),
+            ("revenue cache", revenue_redis_client.aclose),
+        ):
+            try:
+                await close()
+            except Exception:
+                logger.warning("Error closing %s", name)
+
+        try:
+            from .core.supabase_connection_pool import supabase_pool
+
+            await supabase_pool.close()
+            logger.info("✅ Supabase connection pool closed")
+        except Exception as e:
+            logger.warning(f"⚠️ Error closing connection pool: {e}")
 
 
 app = FastAPI(
@@ -152,6 +164,8 @@ app.add_middleware(
         "http://localhost:3000",
         "http://localhost:5173",
         "http://127.0.0.1:3000",
+        "http://localhost:3001",
+        "http://127.0.0.1:3001",
         "http://127.0.0.1:5173",
         "http://localhost:5174",
         "http://127.0.0.1:5174",
